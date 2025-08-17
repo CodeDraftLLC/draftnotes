@@ -1,0 +1,153 @@
+name: PR Auto-Describe
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  models: read
+
+jobs:
+  generate-pr-description:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Pull Repository Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 📝 Extract Links & Screenshots from PR Body
+        id: pr_links
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get the raw PR body
+          gh pr view ${{ github.event.pull_request.number }} --json body --jq .body > pr_body.md || echo "" > pr_body.md
+
+          python3 - <<'PY'
+          import re, pathlib
+
+          body = pathlib.Path("pr_body.md").read_text(encoding="utf-8", errors="ignore")
+
+          # Markdown links & images
+          md_links = re.findall(r"!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)", body)
+
+          # Raw URLs (http/https only)
+          raw_urls = re.findall(r"https?://[^\s)]+", body)
+
+          # HTML image tags
+          html_imgs = re.findall(r"<img\s+[^>]*src=[\"']([^\"']+)[\"'][^>]*>", body, flags=re.I)
+
+          # Deduplicate while preserving order
+          seen = set()
+          def unique(seq):
+              for x in seq:
+                  if x not in seen:
+                      seen.add(x)
+                      yield x
+
+          results = list(unique(md_links + raw_urls + html_imgs))
+
+          # Save for later steps
+          out_text = "\n".join(results)
+          pathlib.Path("pr_links.txt").write_text(out_text, encoding="utf-8")
+
+          print("=== Extracted Links/Screenshots ===")
+          print(out_text or "(none found)")
+          PY
+      - name: 🧾 Build compact PR context
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --prune origin +refs/heads/*:refs/remotes/origin/*
+          BEFORE="${{ github.event.pull_request.base.sha }}"
+          AFTER="${{ github.event.pull_request.head.sha }}"
+
+          # 1) Names + status
+          git diff --name-status "$BEFORE" "$AFTER" > files_status.txt
+
+          # 2) Hunk headers only: unified=0 + strip patch bodies
+          git diff --unified=0 --minimal --no-color "$BEFORE" "$AFTER" > pr.diff
+          # keep only file headers + @@ hunk headers; drop code lines
+          awk '/^diff --git/ || /^@@/' pr.diff > pr.hunks
+
+          # 3) Limit size to ≈30KB (way under 8k tokens with your template)
+          awk 'BEGIN{max=30000} {print; size+=length($0)+1; if(size>max){exit}}' pr.hunks > pr.hunks.small
+
+          {
+            echo "## Files (status)"
+            sed 's/^/ - /' files_status.txt
+            echo
+            echo "## Hunk headers (truncated)"
+            cat pr.hunks.small
+          } > compact_context.md
+
+          wc -c compact_context.md
+
+      - name: 🧩 Assemble AI Prompt
+        run: |
+          cat > final_prompt.md <<'EOF'
+          You are a release-notes assistant. Use ONLY the compact context below and produce a PR description.
+          RULES:
+          - In **Summary**, mention the overall intent using commit subjects if present, and cite at least **2 exact filenames** verbatim.
+          - Populate a section **only if there is clear evidence**:
+            - **Added**: a new file appears (status A) or commit subjects explicitly say “add…”.
+            - **Removed**: a file is deleted (status D) or commit subjects say “remove…/delete…”.
+            - **Fixed**: commit subjects say “fix/bug/patch” or hunks indicate obvious bugfix.
+            - **Changed**: default bucket for edits; safe to use if none of the above apply.
+          - If only docs or workflows changed, describe it as maintenance/update, not a feature.
+          - Do **not** invent items. Omit any section that would be empty.
+          - Keep bullets concise. Never paste raw patches.
+
+          ## ✨ Summary
+          (1–3 sentences: what & why)
+
+          ## 🔄 Changes
+          - **Added**:
+          - **Changed**:
+          - **Fixed**:
+          - **Removed**:
+
+          ## 🧪 Testing
+          (manual/auto steps found; else blank)
+
+          ## 📎 Links
+          (issues/PRs/docs; else blank)
+
+          --- COMPACT CONTEXT START ---
+          EOF
+
+          # Add compact context first
+          cat compact_context.md >> final_prompt.md
+
+          # Append extracted links/screenshots (from pr_links.txt step)
+          echo "" >> final_prompt.md
+          echo "--- EXTRACTED LINKS & SCREENSHOTS ---" >> final_prompt.md
+          cat pr_links.txt >> final_prompt.md
+
+          # Close out the context block
+          echo '--- COMPACT CONTEXT END ---' >> final_prompt.md
+
+      - name: 🤖 Draft PR Description
+        id: ai
+        uses: actions/ai-inference@v1.2.8
+        with:
+          model: openai/gpt-4o-mini         # 8k context is fine now
+          prompt-file: final_prompt.md
+          max-tokens: 700
+          enable-github-mcp: false 
+
+      - name: 📤 Update PR Description on GitHub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY_FILE="${{ steps.ai.outputs.response-file }}"
+          if [ -z "$BODY_FILE" ] || [ ! -f "$BODY_FILE" ]; then
+            echo "${{ steps.ai.outputs.response }}" > pr.md
+            BODY_FILE=pr.md
+          fi
+          echo "=== model output head ==="
+          sed -n '1,120p' "$BODY_FILE" || true
+          gh pr edit ${{ github.event.pull_request.number }} --body-file "$BODY_FILE"
