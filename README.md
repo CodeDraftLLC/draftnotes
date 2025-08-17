@@ -2,7 +2,7 @@
 
 This repository contains notes, experiments, and workflows shared in **Draft Notes**, a series of one-off letters where I dig into engineering hacks, automation tricks, and real-world experiments.
 
-Each issue is published as a newsletter but the raw notes, YAML workflows, and extra context live here for anyone who wants to dig deeper.
+Each issue is published as a newsletter but the raw notes, YAML workflows, and extra context live here for anyone who wants to dig deeper!
 
 ---
 
